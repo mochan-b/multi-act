@@ -4,14 +4,12 @@ import numpy as np
 import argparse
 import matplotlib.pyplot as plt
 import h5py
+import yaml
 
-from constants import PUPPET_GRIPPER_POSITION_NORMALIZE_FN, SIM_TASK_CONFIGS
+from constants import PUPPET_GRIPPER_POSITION_NORMALIZE_FN
 from ee_sim_env import make_ee_sim_env
 from sim_env import make_sim_env, BOX_POSE
 from scripted_policy import PickAndTransferPolicy, InsertionPolicy
-
-import IPython
-e = IPython.embed
 
 
 def main(args):
@@ -33,8 +31,8 @@ def main(args):
     if not os.path.isdir(dataset_dir):
         os.makedirs(dataset_dir, exist_ok=True)
 
-    episode_len = SIM_TASK_CONFIGS[task_name]['episode_len']
-    camera_names = SIM_TASK_CONFIGS[task_name]['camera_names']
+    episode_len = args['episode_len']
+    camera_names = args['camera_names']
     if task_name == 'sim_transfer_cube_scripted':
         policy_cls = PickAndTransferPolicy
     elif task_name == 'sim_insertion_scripted':
@@ -79,9 +77,9 @@ def main(args):
             left_ctrl = PUPPET_GRIPPER_POSITION_NORMALIZE_FN(ctrl[0])
             right_ctrl = PUPPET_GRIPPER_POSITION_NORMALIZE_FN(ctrl[2])
             joint[6] = left_ctrl
-            joint[6+7] = right_ctrl
+            joint[6 + 7] = right_ctrl
 
-        subtask_info = episode[0].observation['env_state'].copy() # box pose at step 0
+        subtask_info = episode[0].observation['env_state'].copy()  # box pose at step 0
 
         # clear unused variables
         del env
@@ -91,7 +89,7 @@ def main(args):
         # setup the environment
         print('Replaying joint commands')
         env = make_sim_env(task_name)
-        BOX_POSE[0] = subtask_info # make sure the sim_env has the same object configurations as ee_sim_env
+        BOX_POSE[0] = subtask_info  # make sure the sim_env has the same object configurations as ee_sim_env
         ts = env.reset()
 
         episode_replay = [ts]
@@ -100,7 +98,7 @@ def main(args):
             ax = plt.subplot()
             plt_img = ax.imshow(ts.observation['images'][render_cam_name])
             plt.ion()
-        for t in range(len(joint_traj)): # note: this will increase episode length by 1
+        for t in range(len(joint_traj)):  # note: this will increase episode length by 1
             action = joint_traj[t]
             ts = env.step(action)
             episode_replay.append(ts)
@@ -160,6 +158,8 @@ def main(args):
         dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}')
         with h5py.File(dataset_path + '.hdf5', 'w', rdcc_nbytes=1024 ** 2 * 2) as root:
             root.attrs['sim'] = True
+            root.attrs['task_name'] = task_name
+
             obs = root.create_group('observations')
             image = obs.create_group('images')
             for cam_name in camera_names:
@@ -178,12 +178,15 @@ def main(args):
     print(f'Saved to {dataset_dir}')
     print(f'Success: {np.sum(success)} / {len(success)}')
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
-    parser.add_argument('--dataset_dir', action='store', type=str, help='dataset saving dir', required=True)
-    parser.add_argument('--num_episodes', action='store', type=int, help='num_episodes', required=False)
-    parser.add_argument('--onscreen_render', action='store_true')
-    
-    main(vars(parser.parse_args()))
 
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Generate demonstration data in simulation')
+    parser.add_argument('config', action='store', type=str, help='Configuration yaml file')
+    yaml_file = parser.parse_args().config
+    print(f'Using config: {yaml_file}')
+
+    # Read the contents of the config file and convert to dictionary
+    with open(yaml_file, 'r') as f:
+        args = yaml.load(f, Loader=yaml.FullLoader)
+
+    main(args)

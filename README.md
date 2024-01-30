@@ -1,3 +1,9 @@
+# Multi-ACT : Multi-Action Chunking with Transformers
+
+This is a minor modification to ACT that allows for multi-task learning with the ACT policy.
+
+---
+
 # ACT: Action Chunking with Transformers
 
 ### *New*: [ACT tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing)

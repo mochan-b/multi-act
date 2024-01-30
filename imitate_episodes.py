@@ -3,6 +3,7 @@ import numpy as np
 import os
 import pickle
 import argparse
+import yaml
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
@@ -10,16 +11,15 @@ from einops import rearrange
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
-from utils import load_data # data functions
-from utils import sample_box_pose, sample_insertion_pose # robot functions
-from utils import compute_dict_mean, set_seed, detach_dict # helper functions
+from text_encoders import ClipLanguageConditioned
+from utils import load_data  # data functions
+from utils import sample_box_pose, sample_insertion_pose  # robot functions
+from utils import compute_dict_mean, set_seed, detach_dict  # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
 
-import IPython
-e = IPython.embed
 
 def main(args):
     set_seed(1)
@@ -34,17 +34,31 @@ def main(args):
     num_epochs = args['num_epochs']
 
     # get task parameters
-    is_sim = task_name[:4] == 'sim_'
+    is_sim = task_name[0][:4] == 'sim_'
+
     if is_sim:
-        from constants import SIM_TASK_CONFIGS
-        task_config = SIM_TASK_CONFIGS[task_name]
+        pass
     else:
         from aloha_scripts.constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
-    dataset_dir = task_config['dataset_dir']
-    num_episodes = task_config['num_episodes']
-    episode_len = task_config['episode_len']
-    camera_names = task_config['camera_names']
+
+    # For each task, get the yaml files
+    task_yaml_file = []
+    task_yaml_data = []
+    for task in task_name:
+        task_yaml_file.append(os.path.join(args['task_config_dir'], task + '.yaml'))
+        with open(task_yaml_file[-1], 'r') as f:
+            task_yaml_data.append(yaml.load(f, Loader=yaml.FullLoader))
+
+    # Check that the camera names are the same for all of the tasks
+    camera_names = task_yaml_data[0]['camera_names']
+    for task in task_yaml_data:
+        assert task['camera_names'] == camera_names
+
+    # Get the various parameters for each task
+    dataset_dir = [task['dataset_dir'] for task in task_yaml_data]
+    num_episodes = [task['num_episodes'] for task in task_yaml_data]
+    episode_len = [task['episode_len'] for task in task_yaml_data]
 
     # fixed parameters
     state_dim = 14
@@ -66,9 +80,13 @@ def main(args):
                          'nheads': nheads,
                          'camera_names': camera_names,
                          }
+        # Add all the args to the policy config
+        for k, v in args.items():
+            policy_config[k] = v
+
     elif policy_class == 'CNNMLP':
-        policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names,}
+        policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone': backbone, 'num_queries': 1,
+                         'camera_names': camera_names, }
     else:
         raise NotImplementedError
 
@@ -100,7 +118,8 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train,
+                                                           batch_size_val)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -150,6 +169,10 @@ def get_image(ts, camera_names):
 
 def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(1000)
+
+    task_name = config['policy_config']['eval_task']
+    task_index = config['task_name'].index(task_name)
+
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
     real_robot = config['real_robot']
@@ -157,14 +180,15 @@ def eval_bc(config, ckpt_name, save_episode=True):
     onscreen_render = config['onscreen_render']
     policy_config = config['policy_config']
     camera_names = config['camera_names']
-    max_timesteps = config['episode_len']
-    task_name = config['task_name']
+    max_timesteps = config['episode_len'][task_index]
     temporal_agg = config['temporal_agg']
+    eval_task = config['policy_config']['eval_task']
     onscreen_cam = 'angle'
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
+    clip = ClipLanguageConditioned()
     loading_status = policy.load_state_dict(torch.load(ckpt_path))
     print(loading_status)
     policy.cuda()
@@ -179,8 +203,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     # load environment
     if real_robot:
-        from aloha_scripts.robot_utils import move_grippers # requires aloha
-        from aloha_scripts.real_env import make_real_env # requires aloha
+        from aloha_scripts.robot_utils import move_grippers  # requires aloha
+        from aloha_scripts.real_env import make_real_env  # requires aloha
         env = make_real_env(init_node=True)
         env_max_reward = 0
     else:
@@ -193,7 +217,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         query_frequency = 1
         num_queries = policy_config['num_queries']
 
-    max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
+    max_timesteps = int(max_timesteps * 1)  # may increase for real-world tasks
 
     num_rollouts = 50
     episode_returns = []
@@ -202,9 +226,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
         rollout_id += 0
         ### set task
         if 'sim_transfer_cube' in task_name:
-            BOX_POSE[0] = sample_box_pose() # used in sim reset
+            BOX_POSE[0] = sample_box_pose()  # used in sim reset
         elif 'sim_insertion' in task_name:
-            BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
+            BOX_POSE[0] = np.concatenate(sample_insertion_pose())  # used in sim reset
 
         ts = env.reset()
 
@@ -216,10 +240,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps + num_queries, state_dim]).cuda()
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-        image_list = [] # for visualization
+        image_list = []  # for visualization
         qpos_list = []
         target_qpos_list = []
         rewards = []
@@ -242,13 +266,14 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                 qpos_history[:, t] = qpos
                 curr_image = get_image(ts, camera_names)
+                task_embeddings = clip.get_text_feature(eval_task).unsqueeze(dim=0).cuda()
 
                 ### query policy
                 if config['policy_class'] == "ACT":
                     if t % query_frequency == 0:
-                        all_actions = policy(qpos, curr_image)
+                        all_actions = policy(qpos, curr_image, task_embeddings=task_embeddings)
                     if temporal_agg:
-                        all_time_actions[[t], t:t+num_queries] = all_actions
+                        all_time_actions[[t], t:t + num_queries] = all_actions
                         actions_for_curr_step = all_time_actions[:, t]
                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
                         actions_for_curr_step = actions_for_curr_step[actions_populated]
@@ -279,15 +304,17 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
             plt.close()
         if real_robot:
-            move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
+            move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2,
+                          move_time=0.5)  # open
             pass
 
         rewards = np.array(rewards)
-        episode_return = np.sum(rewards[rewards!=None])
+        episode_return = np.sum(rewards[rewards != None])
         episode_returns.append(episode_return)
         episode_highest_reward = np.max(rewards)
         highest_rewards.append(episode_highest_reward)
-        print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
+        print(
+            f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward == env_max_reward}')
 
         if save_episode:
             save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
@@ -295,10 +322,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
     summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
-    for r in range(env_max_reward+1):
+    for r in range(env_max_reward + 1):
         more_or_equal_r = (np.array(highest_rewards) >= r).sum()
         more_or_equal_r_rate = more_or_equal_r / num_rollouts
-        summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
+        summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate * 100}%\n'
 
     print(summary_str)
 
@@ -313,10 +340,12 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-def forward_pass(data, policy):
-    image_data, qpos_data, action_data, is_pad = data
+def forward_pass(data, policy, clip):
+    image_data, qpos_data, action_data, task_names, is_pad = data
+    task_embeddings = [clip.get_text_feature(task_name) for task_name in task_names]
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    task_embeddings = torch.stack(task_embeddings).cuda()
+    return policy(qpos_data, image_data, action_data, task_embeddings, is_pad)  # TODO remove None
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -327,6 +356,8 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy_config = config['policy_config']
 
     set_seed(seed)
+
+    clip = ClipLanguageConditioned()
 
     policy = make_policy(policy_class, policy_config)
     policy.cuda()
@@ -343,7 +374,7 @@ def train_bc(train_dataloader, val_dataloader, config):
             policy.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy)
+                forward_dict = forward_pass(data, policy, clip)
                 epoch_dicts.append(forward_dict)
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
@@ -362,14 +393,14 @@ def train_bc(train_dataloader, val_dataloader, config):
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy)
+            forward_dict = forward_pass(data, policy, clip)
             # backward
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
-        epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
+        epoch_summary = compute_dict_mean(train_history[(batch_idx + 1) * epoch:(batch_idx + 1) * (epoch + 1)])
         epoch_train_loss = epoch_summary['loss']
         print(f'Train loss: {epoch_train_loss:.5f}')
         summary_string = ''
@@ -403,8 +434,8 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         plt.figure()
         train_values = [summary[key].item() for summary in train_history]
         val_values = [summary[key].item() for summary in validation_history]
-        plt.plot(np.linspace(0, num_epochs-1, len(train_history)), train_values, label='train')
-        plt.plot(np.linspace(0, num_epochs-1, len(validation_history)), val_values, label='validation')
+        plt.plot(np.linspace(0, num_epochs - 1, len(train_history)), train_values, label='train')
+        plt.plot(np.linspace(0, num_epochs - 1, len(validation_history)), val_values, label='validation')
         # plt.ylim([-0.1, 1])
         plt.tight_layout()
         plt.legend()
@@ -415,21 +446,29 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--onscreen_render', action='store_true')
-    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
-    parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
-    parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
-    parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
-    parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
-    parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
-    parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
+    parser.add_argument('config', action='store', type=str, help='Configuration yaml file')
+    yaml_file = parser.parse_args().config
+    print(f'Using config: {yaml_file}')
 
-    # for ACT
-    parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
-    parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
-    parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
-    parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
-    parser.add_argument('--temporal_agg', action='store_true')
-    
-    main(vars(parser.parse_args()))
+    # Read the contents of the config file and convert to dictionary
+    with open(yaml_file, 'r') as f:
+        args = yaml.load(f, Loader=yaml.FullLoader)
+
+    # parser.add_argument('--eval', action='store_true')
+    # parser.add_argument('--onscreen_render', action='store_true')
+    # parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
+    # parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
+    # parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
+    # parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
+    # parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
+    # parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
+    # parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
+    #
+    # # for ACT
+    # parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
+    # parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
+    # parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
+    # parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
+    # parser.add_argument('--temporal_agg', action='store_true')
+
+    main(args)

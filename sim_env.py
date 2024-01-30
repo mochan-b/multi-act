@@ -12,10 +12,8 @@ from constants import MASTER_GRIPPER_POSITION_NORMALIZE_FN
 from constants import PUPPET_GRIPPER_POSITION_NORMALIZE_FN
 from constants import PUPPET_GRIPPER_VELOCITY_NORMALIZE_FN
 
-import IPython
-e = IPython.embed
+BOX_POSE = [None]  # to be changed from outside
 
-BOX_POSE = [None] # to be changed from outside
 
 def make_sim_env(task_name):
     """
@@ -39,17 +37,18 @@ def make_sim_env(task_name):
         xml_path = os.path.join(XML_DIR, f'bimanual_viperx_transfer_cube.xml')
         physics = mujoco.Physics.from_xml_path(xml_path)
         task = TransferCubeTask(random=False)
-        env = control.Environment(physics, task, time_limit=20, control_timestep=DT,
-                                  n_sub_steps=None, flat_observation=False)
+        env = control.Environment(physics, task, time_limit=100,
+                                  n_sub_steps=100, flat_observation=False)
     elif 'sim_insertion' in task_name:
         xml_path = os.path.join(XML_DIR, f'bimanual_viperx_insertion.xml')
         physics = mujoco.Physics.from_xml_path(xml_path)
         task = InsertionTask(random=False)
-        env = control.Environment(physics, task, time_limit=20, control_timestep=DT,
-                                  n_sub_steps=None, flat_observation=False)
+        env = control.Environment(physics, task, time_limit=100,
+                                  n_sub_steps=100, flat_observation=False)
     else:
         raise NotImplementedError
     return env
+
 
 class BimanualViperXTask(base.Task):
     def __init__(self, random=None):
@@ -57,9 +56,9 @@ class BimanualViperXTask(base.Task):
 
     def before_step(self, action, physics):
         left_arm_action = action[:6]
-        right_arm_action = action[7:7+6]
+        right_arm_action = action[7:7 + 6]
         normalized_left_gripper_action = action[6]
-        normalized_right_gripper_action = action[7+6]
+        normalized_right_gripper_action = action[7 + 6]
 
         left_gripper_action = PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN(normalized_left_gripper_action)
         right_gripper_action = PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN(normalized_right_gripper_action)
@@ -67,7 +66,8 @@ class BimanualViperXTask(base.Task):
         full_left_gripper_action = [left_gripper_action, -left_gripper_action]
         full_right_gripper_action = [right_gripper_action, -right_gripper_action]
 
-        env_action = np.concatenate([left_arm_action, full_left_gripper_action, right_arm_action, full_right_gripper_action])
+        env_action = np.concatenate(
+            [left_arm_action, full_left_gripper_action, right_arm_action, full_right_gripper_action])
         super().before_step(env_action, physics)
         return
 
@@ -158,11 +158,11 @@ class TransferCubeTask(BimanualViperXTask):
         reward = 0
         if touch_right_gripper:
             reward = 1
-        if touch_right_gripper and not touch_table: # lifted
+        if touch_right_gripper and not touch_table:  # lifted
             reward = 2
-        if touch_left_gripper: # attempted transfer
+        if touch_left_gripper:  # attempted transfer
             reward = 3
-        if touch_left_gripper and not touch_table: # successful transfer
+        if touch_left_gripper and not touch_table:  # successful transfer
             reward = 4
         return reward
 
@@ -180,7 +180,7 @@ class InsertionTask(BimanualViperXTask):
             physics.named.data.qpos[:16] = START_ARM_POSE
             np.copyto(physics.data.ctrl, START_ARM_POSE)
             assert BOX_POSE[0] is not None
-            physics.named.data.qpos[-7*2:] = BOX_POSE[0] # two objects
+            physics.named.data.qpos[-7 * 2:] = BOX_POSE[0]  # two objects
             # print(f"{BOX_POSE=}")
         super().initialize_episode(physics)
 
@@ -218,13 +218,14 @@ class InsertionTask(BimanualViperXTask):
         pin_touched = ("red_peg", "pin") in all_contact_pairs
 
         reward = 0
-        if touch_left_gripper and touch_right_gripper: # touch both
+        if touch_left_gripper and touch_right_gripper:  # touch both
             reward = 1
-        if touch_left_gripper and touch_right_gripper and (not peg_touch_table) and (not socket_touch_table): # grasp both
+        if touch_left_gripper and touch_right_gripper and (not peg_touch_table) and (
+        not socket_touch_table):  # grasp both
             reward = 2
-        if peg_touch_socket and (not peg_touch_table) and (not socket_touch_table): # peg and socket touching
+        if peg_touch_socket and (not peg_touch_table) and (not socket_touch_table):  # peg and socket touching
             reward = 3
-        if pin_touched: # successful insertion
+        if pin_touched:  # successful insertion
             reward = 4
         return reward
 
@@ -233,15 +234,16 @@ def get_action(master_bot_left, master_bot_right):
     action = np.zeros(14)
     # arm action
     action[:6] = master_bot_left.dxl.joint_states.position[:6]
-    action[7:7+6] = master_bot_right.dxl.joint_states.position[:6]
+    action[7:7 + 6] = master_bot_right.dxl.joint_states.position[:6]
     # gripper action
     left_gripper_pos = master_bot_left.dxl.joint_states.position[7]
     right_gripper_pos = master_bot_right.dxl.joint_states.position[7]
     normalized_left_pos = MASTER_GRIPPER_POSITION_NORMALIZE_FN(left_gripper_pos)
     normalized_right_pos = MASTER_GRIPPER_POSITION_NORMALIZE_FN(right_gripper_pos)
     action[6] = normalized_left_pos
-    action[7+6] = normalized_right_pos
+    action[7 + 6] = normalized_right_pos
     return action
+
 
 def test_sim_teleop():
     """ Testing teleoperation in sim with ALOHA. Requires hardware and ALOHA repo to work. """
@@ -253,7 +255,7 @@ def test_sim_teleop():
     master_bot_left = InterbotixManipulatorXS(robot_model="wx250s", group_name="arm", gripper_name="gripper",
                                               robot_name=f'master_left', init_node=True)
     master_bot_right = InterbotixManipulatorXS(robot_model="wx250s", group_name="arm", gripper_name="gripper",
-                                              robot_name=f'master_right', init_node=False)
+                                               robot_name=f'master_right', init_node=False)
 
     # setup the environment
     env = make_sim_env('sim_transfer_cube')
@@ -275,4 +277,3 @@ def test_sim_teleop():
 
 if __name__ == '__main__':
     test_sim_teleop()
-
