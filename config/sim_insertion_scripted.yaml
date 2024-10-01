@@ -19,4 +19,4 @@ onscreen_render: False
 #     'camera_names': ['top']
 # },
 episode_len: 400
-camera_names: ['top']
+camera_names: ['top', 'angle', 'vis']

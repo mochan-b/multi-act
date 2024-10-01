@@ -6,11 +6,13 @@ from torch.utils.data import TensorDataset, DataLoader
 
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats):
+    def __init__(self, episode_ids, dataset_dirs, camera_names, norm_stats):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
-        self.dataset_dir = dataset_dir
+        self.dataset_dirs = dataset_dirs
         self.camera_names = camera_names
+        self.n_cameras = len(camera_names)
+        self.camera_indices = np.arange(self.n_cameras)
         self.norm_stats = norm_stats
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
@@ -18,25 +20,39 @@ class EpisodicDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.episode_ids)
 
+    def set_camera_indices(self, camera_indices):
+        """
+        How many cameras to output in get_item
+        """
+        self.camera_indices = camera_indices
+
     def __getitem__(self, index):
         sample_full_episode = False  # hardcode
 
         dataset_id, episode_id = self.episode_ids[index]
-        dataset_path = os.path.join(self.dataset_dir[dataset_id], f'episode_{episode_id}.hdf5')
+        dataset_path = os.path.join(self.dataset_dirs[dataset_id], f'episode_{episode_id}.hdf5')
+
+        # Get a random arrangement of the cameras
+        sample_camera_names = [self.camera_names[i] for i in self.camera_indices]
+        # print(sample_camera_names)
+
         with h5py.File(dataset_path, 'r') as root:
             is_sim = root.attrs['sim']
             task_name = root.attrs['task_name']
             original_action_shape = root['/action'].shape
             episode_len = original_action_shape[0]
+
+            # Get the observation at a random timestep
             if sample_full_episode:
                 start_ts = 0
             else:
                 start_ts = np.random.choice(episode_len)
+
             # get observation at start_ts only
             qpos = root['/observations/qpos'][start_ts]
             qvel = root['/observations/qvel'][start_ts]
             image_dict = dict()
-            for cam_name in self.camera_names:
+            for cam_name in sample_camera_names:
                 image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
             # get all actions after and including start_ts
             if is_sim:
@@ -54,7 +70,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
         # new axis for different cameras
         all_cam_images = []
-        for cam_name in self.camera_names:
+        for cam_name in sample_camera_names:
             all_cam_images.append(image_dict[cam_name])
         all_cam_images = np.stack(all_cam_images, axis=0)
 
@@ -72,7 +88,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
-        return image_data, qpos_data, action_data, task_name, is_pad
+        return image_data, qpos_data, action_data, task_name, self.camera_indices, is_pad
 
 
 def get_norm_stats(dataset_dir, num_episodes):
@@ -130,9 +146,8 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     train_dataset = EpisodicDataset(train_episodes, dataset_dir, camera_names, norm_stats)
     val_dataset = EpisodicDataset(val_episodes, dataset_dir, camera_names, norm_stats)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True,
-                                  num_workers=1, prefetch_factor=1)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1,
-                                prefetch_factor=1)
+                                  num_workers=0)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=0)
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
 

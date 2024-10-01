@@ -1,3 +1,4 @@
+import glob
 import torch
 import numpy as np
 import os
@@ -32,6 +33,7 @@ def main(args):
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
+    resume = args.get('resume', False)
 
     # get task parameters
     is_sim = task_name[0][:4] == 'sim_'
@@ -103,7 +105,8 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'resume': resume,
     }
 
     if is_eval:
@@ -183,6 +186,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     max_timesteps = config['episode_len'][task_index]
     temporal_agg = config['temporal_agg']
     eval_task = config['policy_config']['eval_task']
+    camera_names_eval = config['policy_config']['camera_names_eval']
     onscreen_cam = 'angle'
 
     # load policy and stats
@@ -271,7 +275,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 ### query policy
                 if config['policy_class'] == "ACT":
                     if t % query_frequency == 0:
-                        all_actions = policy(qpos, curr_image, task_embeddings=task_embeddings)
+                        camera_indices = [camera_names.index(cam_name) for cam_name in camera_names_eval]
+                        all_actions = policy(qpos, curr_image, task_embeddings=task_embeddings,
+                                             camera_indices=camera_indices)
                     if temporal_agg:
                         all_time_actions[[t], t:t + num_queries] = all_actions
                         actions_for_curr_step = all_time_actions[:, t]
@@ -340,12 +346,19 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-def forward_pass(data, policy, clip):
-    image_data, qpos_data, action_data, task_names, is_pad = data
-    task_embeddings = [clip.get_text_feature(task_name) for task_name in task_names]
+def forward_pass(data, policy, clip, camera_names):
+    image_data, qpos_data, action_data, task_names, camera_indices, is_pad = data
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+
+    # Make the task embeddings
+    task_embeddings = [clip.get_text_feature(task_name) for task_name in task_names]
     task_embeddings = torch.stack(task_embeddings).cuda()
-    return policy(qpos_data, image_data, action_data, task_embeddings, is_pad)  # TODO remove None
+
+    # The camera indices are all the same for the batch. We only need the first one
+    camera_indices0 = camera_indices[0]
+
+    # Get the policy output
+    return policy(qpos_data, image_data, action_data, task_embeddings, camera_indices0, is_pad)  # TODO remove None
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -354,6 +367,8 @@ def train_bc(train_dataloader, val_dataloader, config):
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
+    camera_names = config['camera_names']
+    resume = config['resume']
 
     set_seed(seed)
 
@@ -363,19 +378,37 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 
+    # Check if we want to resume training from a previous checkpoint
+    start_epoch = 0
+    if resume:
+        # Find the latest ckpt file to resume from
+        ckpt_files = os.listdir(ckpt_dir)
+        ckpt_files = glob.glob(os.path.join(ckpt_dir, f'policy_epoch_*_seed_{seed}.ckpt'))
+
+        # Check that ckpt_files is not empty
+        if len(ckpt_files) > 0:
+            latest_ckpt = max(ckpt_files, key=os.path.getmtime)
+
+            # Get the epoch number from the ckpt file
+            start_epoch = int(latest_ckpt.split('_')[2])
+
+            # Load the policy from the ckpt file to resume from
+            policy.load_state_dict(torch.load(latest_ckpt))
+
     train_history = []
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
-    for epoch in tqdm(range(num_epochs)):
+    for epoch in tqdm(range(start_epoch, num_epochs)):
         print(f'\nEpoch {epoch}')
         # validation
         with torch.inference_mode():
             policy.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy, clip)
+                forward_dict = forward_pass(data, policy, clip, camera_names)
                 epoch_dicts.append(forward_dict)
+
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
 
@@ -393,14 +426,23 @@ def train_bc(train_dataloader, val_dataloader, config):
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy, clip)
+            forward_dict = forward_pass(data, policy, clip, camera_names)
             # backward
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
-        epoch_summary = compute_dict_mean(train_history[(batch_idx + 1) * epoch:(batch_idx + 1) * (epoch + 1)])
+
+            # Get a number between 1 and num_cameras+1 and set the cameras to sample from in the dataset
+            n_cameras = len(camera_names)
+            sample_cameras = np.random.randint(0, len(camera_names)) + 1
+            camera_indices = np.random.choice(n_cameras, sample_cameras, replace=False)
+            # print(camera_indices)
+            train_dataloader.dataset.set_camera_indices(camera_indices)
+
+        epoch_summary = compute_dict_mean(
+            train_history[(batch_idx + 1) * (epoch - start_epoch):(batch_idx + 1) * ((epoch - start_epoch) + 1)])
         epoch_train_loss = epoch_summary['loss']
         print(f'Train loss: {epoch_train_loss:.5f}')
         summary_string = ''

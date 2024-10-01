@@ -36,8 +36,8 @@ def make_ee_sim_env(task_name):
         xml_path = os.path.join(XML_DIR, f'bimanual_viperx_ee_transfer_cube.xml')
         physics = mujoco.Physics.from_xml_path(xml_path)
         task = TransferCubeEETask(random=False)
-        env = control.Environment(physics, task, time_limit=500,
-                                  n_sub_steps=200, flat_observation=False)
+        env = control.Environment(physics, task, time_limit=20, control_timestep=DT,
+                                  n_sub_steps=None, flat_observation=False)
     elif 'sim_insertion' in task_name:
         xml_path = os.path.join(XML_DIR, f'bimanual_viperx_ee_insertion.xml')
         physics = mujoco.Physics.from_xml_path(xml_path)
@@ -257,7 +257,7 @@ class InsertionEETask(BimanualViperXEETask):
         if touch_left_gripper and touch_right_gripper:  # touch both
             reward = 1
         if touch_left_gripper and touch_right_gripper and (not peg_touch_table) and (
-        not socket_touch_table):  # grasp both
+                not socket_touch_table):  # grasp both
             reward = 2
         if peg_touch_socket and (not peg_touch_table) and (not socket_touch_table):  # peg and socket touching
             reward = 3

@@ -60,7 +60,10 @@ class DETRVAE(nn.Module):
             self.input_proj_env_state = nn.Linear(7, hidden_dim)
             self.pos = torch.nn.Embedding(2, hidden_dim)
             self.backbones = None
+
+        # Multi-ACT model extra parameters
         self.input_task_embeddings = nn.Linear(512, hidden_dim)
+        self.camera_embeddings = nn.Embedding(len(camera_names), hidden_dim)
 
         # encoder extra parameters
         self.latent_dim = 32  # final size of latent z # TODO tune
@@ -76,7 +79,7 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)  # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(3, hidden_dim)  # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, task_embeddings=None, is_pad=None):
+    def forward(self, qpos, image, env_state, actions=None, task_embeddings=None, camera_indices=None, is_pad=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -95,7 +98,8 @@ class DETRVAE(nn.Module):
             cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1)  # (bs, 1, hidden_dim)
             task_name_embed = self.encoder_task_proj(task_embeddings)  # (bs, hidden_dim)
             task_name_embed = torch.unsqueeze(task_name_embed, axis=1)
-            encoder_input = torch.cat([cls_embed, qpos_embed, action_embed, task_name_embed], axis=1)  # (bs, seq+1, hidden_dim)
+            encoder_input = torch.cat([cls_embed, qpos_embed, action_embed, task_name_embed],
+                                      axis=1)  # (bs, seq+1, hidden_dim)
             encoder_input = encoder_input.permute(1, 0, 2)  # (seq+1, bs, hidden_dim)
             # do not mask cls token
             cls_joint_is_pad = torch.full((bs, 3), False).to(qpos.device)  # False: not a padding
@@ -120,12 +124,21 @@ class DETRVAE(nn.Module):
             # Image observation features and position embeddings
             all_cam_features = []
             all_cam_pos = []
-            for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[0](image[:, cam_id])  # HARDCODED
-                features = features[0]  # take the last layer feature
-                pos = pos[0]
-                all_cam_features.append(self.input_proj(features))
-                all_cam_pos.append(pos)
+
+            # Pass the images through their respective backbones
+            image = image.permute(1, 0, 2, 3, 4)
+            permuted_backbones = [self.backbones[index] for index in camera_indices]
+            output = [backbone(x_) for backbone, x_ in zip(permuted_backbones, image)]
+
+            # Get the features embeddings for each camera
+            cam_embeddings = [self.camera_embeddings(torch.tensor([index]).to(image.device)).view(1, 512, 1, 1) for
+                              index in camera_indices]
+
+            # Concatenate the features and the camera embeddings
+            all_cam_features = [self.input_proj(features[0]) + cam_embeddings[index] for index, (features, _) in
+                                enumerate(output)]
+            all_cam_pos = [pos[0] for _, pos in output]
+
             # proprioception features
             proprio_input = self.input_proj_robot_state(qpos)
             task_name_input = self.input_task_embeddings(task_embeddings)
@@ -233,12 +246,8 @@ def build_encoder(args):
 def build(args):
     state_dim = 14  # TODO hardcode
 
-    # From state
-    # backbone = None # from state for now, no need for conv nets
-    # From image
-    backbones = []
-    backbone = build_backbone(args)
-    backbones.append(backbone)
+    # Build backbone for each camera
+    backbones = [build_backbone(args) for _ in args.camera_names]
 
     transformer = build_transformer(args)
 
