@@ -11,10 +11,11 @@ task_config_dir: config
 task_name:
   - sim_insertion_scripted
   - sim_transfer_cube_scripted
-ckpt_dir: ckpt/mc3
+ckpt_dir: ckpt/mh
 policy_class: ACT
 kl_weight: 10
 chunk_size: 80
+eval_chunk_size: 75
 hidden_dim: 512
 batch_size: 8
 dim_feedforward: 3200

@@ -20,9 +20,6 @@ class ACTPolicy(nn.Module):
                                          std=[0.229, 0.224, 0.225])
         image = normalize(image)
         if actions is not None:  # training time
-            actions = actions[:, :self.model.num_queries]
-            is_pad = is_pad[:, :self.model.num_queries]
-
             a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, task_embeddings,
                                                          camera_indices, is_pad)
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)

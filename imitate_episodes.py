@@ -72,6 +72,7 @@ def main(args):
         nheads = 8
         policy_config = {'lr': args['lr'],
                          'num_queries': args['chunk_size'],
+                         'eval_num_queries': args.get('eval_chunk_size', None),
                          'kl_weight': args['kl_weight'],
                          'hidden_dim': args['hidden_dim'],
                          'dim_feedforward': args['dim_feedforward'],
@@ -216,7 +217,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         env = make_sim_env(task_name)
         env_max_reward = env.task.max_reward
 
-    query_frequency = policy_config['num_queries']
+    query_frequency = policy_config['eval_num_queries']
     if temporal_agg:
         query_frequency = 1
         num_queries = policy_config['num_queries']
@@ -346,19 +347,48 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-def forward_pass(data, policy, clip, camera_names):
-    image_data, qpos_data, action_data, task_names, camera_indices, is_pad = data
+def forward_pass(data, policy, clip, camera_names, multi_options={}):
+    image_data, qpos_data, action_data, task_names, is_pad = data
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
 
     # Make the task embeddings
     task_embeddings = [clip.get_text_feature(task_name) for task_name in task_names]
     task_embeddings = torch.stack(task_embeddings).cuda()
 
-    # The camera indices are all the same for the batch. We only need the first one
-    camera_indices0 = camera_indices[0]
+    # --- Multi options ---
+
+    # --- Multi camera ---
+    # Get the multi-camera option
+    multi_camera = multi_options.get('multi_camera', False)
+
+    # Get the camera indices
+    n_cameras = len(camera_names)
+    if multi_camera:
+        # Make the choice of sensors that we will be using
+        # Get a number between 1 and num_cameras+1 and set the cameras to sample from in the dataset
+        sample_cameras = np.random.randint(0, len(camera_names)) + 1
+        camera_indices = np.random.choice(n_cameras, sample_cameras, replace=False)
+    else:
+        camera_indices = np.arange(n_cameras)
+
+    # --- Multi horizon ---
+    # Get the multi horizon option
+    multi_horizon = multi_options.get('multi_horizon', False)
+
+    num_queries = policy.model.num_queries    
+    if multi_horizon:
+        # Choose a random value between 1 and self.model.num_queries
+        rand_num_queries = torch.randint(1, num_queries, (1,))
+
+        action_data = action_data[:, :rand_num_queries]
+        is_pad = is_pad[:, :rand_num_queries]
+    else:
+        # Choose all of the num queries
+        action_data = action_data[:, :num_queries]
+        is_pad = is_pad[:, :num_queries]
 
     # Get the policy output
-    return policy(qpos_data, image_data, action_data, task_embeddings, camera_indices0, is_pad)  # TODO remove None
+    return policy(qpos_data, image_data, action_data, task_embeddings, camera_indices, is_pad)
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -369,6 +399,11 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy_config = config['policy_config']
     camera_names = config['camera_names']
     resume = config['resume']
+
+    multi_options = {
+        'multi_camera': config.get('multi_camera', True),
+        'multi_horizon': config.get('multi_horizon', True),
+    }
 
     set_seed(seed)
 
@@ -426,20 +461,13 @@ def train_bc(train_dataloader, val_dataloader, config):
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy, clip, camera_names)
+            forward_dict = forward_pass(data, policy, clip, camera_names, multi_options)
             # backward
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
-
-            # Get a number between 1 and num_cameras+1 and set the cameras to sample from in the dataset
-            n_cameras = len(camera_names)
-            sample_cameras = np.random.randint(0, len(camera_names)) + 1
-            camera_indices = np.random.choice(n_cameras, sample_cameras, replace=False)
-            # print(camera_indices)
-            train_dataloader.dataset.set_camera_indices(camera_indices)
 
         epoch_summary = compute_dict_mean(
             train_history[(batch_idx + 1) * (epoch - start_epoch):(batch_idx + 1) * ((epoch - start_epoch) + 1)])

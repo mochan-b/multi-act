@@ -31,7 +31,7 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
 
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, eval_num_queries, camera_names):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -43,6 +43,7 @@ class DETRVAE(nn.Module):
         """
         super().__init__()
         self.num_queries = num_queries
+        self.eval_num_queries = eval_num_queries
         self.camera_names = camera_names
         self.transformer = transformer
         self.encoder = encoder
@@ -107,6 +108,8 @@ class DETRVAE(nn.Module):
             # obtain position embedding
             pos_embed = self.pos_table.clone().detach()
             pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)
+            action_len = actions.shape[1] + 1 + 1 + 1
+            pos_embed = pos_embed[:action_len]
             # query model
             encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
             encoder_output = encoder_output[0]  # take cls output only
@@ -145,7 +148,14 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, task_name_input,
+
+            # Make the query embed match the shape of the input action sequence
+            if is_training:                
+                query_embed = self.query_embed.weight[:actions.shape[1]]
+            else:
+                query_embed = self.query_embed.weight[:self.eval_num_queries]
+
+            hs = self.transformer(src, None, query_embed, pos, latent_input, proprio_input, task_name_input,
                                   self.additional_pos_embed.weight)[0]
         else:
             qpos = self.input_proj_robot_state(qpos)
@@ -259,6 +269,7 @@ def build(args):
         encoder,
         state_dim=state_dim,
         num_queries=args.num_queries,
+        eval_num_queries=args.eval_num_queries,
         camera_names=args.camera_names,
     )
 
