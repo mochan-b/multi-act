@@ -8,7 +8,7 @@
 task_name: sim_transfer_cube_scripted
 dataset_dir: data/sim_transfer_cube_scripted
 num_episodes: 50
-onscreen_render: True
+onscreen_render: False
 
 # Data from constants.py
 #

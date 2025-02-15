@@ -14,13 +14,13 @@ class ACTPolicy(nn.Module):
         self.kl_weight = args_override['kl_weight']
         print(f'KL Weight {self.kl_weight}')
 
-    def __call__(self, qpos, image, actions=None, task_embeddings=None, camera_indices=None, is_pad=None):
+    def __call__(self, qpos, image, actions=None, action_history_data=None, task_embeddings=None, camera_indices=None, is_pad=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
         image = normalize(image)
         if actions is not None:  # training time
-            a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, task_embeddings,
+            a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, action_history_data, task_embeddings,
                                                          camera_indices, is_pad)
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
@@ -31,7 +31,7 @@ class ACTPolicy(nn.Module):
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
             return loss_dict
         else:  # inference time
-            a_hat, _, (_, _) = self.model(qpos, image, env_state, task_embeddings=task_embeddings,
+            a_hat, _, (_, _) = self.model(qpos, image, env_state, action_history_data=action_history_data, task_embeddings=task_embeddings,
                                           camera_indices=camera_indices)  # no action, sample from prior
             return a_hat
 

@@ -45,7 +45,7 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, task_name_input=None,
-                additional_pos_embed=None):
+                additional_pos_embed=None, qpos_history_embed=None):
         # TODO flatten only when input has H and W
         if len(src.shape) == 4:  # has H and W
             # flatten NxCxHxW to HWxNxC
@@ -55,10 +55,22 @@ class Transformer(nn.Module):
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
             # mask = mask.flatten(1)
 
+            # Build the list of additional inputs
+            addition_inputs = [latent_input, proprio_input, task_name_input]
+            
+            # Add qpos history if provided
+            if qpos_history_embed is not None:
+                # qpos_history_embed is (bs, history_length, hidden_dim), need to permute to (history_length, bs, hidden_dim)
+                qpos_history_embed_permuted = qpos_history_embed.permute(1, 0, 2)  # (history_length, bs, hidden_dim)
+                # Split history into individual time steps and add each as a separate input
+                for i in range(qpos_history_embed_permuted.shape[0]):
+                    addition_inputs.append(qpos_history_embed_permuted[i])  # (bs, hidden_dim)
+            
+            # Use additional_pos_embed directly since it's already sized correctly (3 + history_len)
             additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1)  # seq, bs, dim
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
-
-            addition_input = torch.stack([latent_input, proprio_input, task_name_input], axis=0)
+            
+            addition_input = torch.stack(addition_inputs, axis=0)
             src = torch.cat([addition_input, src], axis=0)
         else:
             assert len(src.shape) == 3

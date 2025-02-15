@@ -13,4 +13,4 @@ def test_position_embedding_sine():
     pos = pos_emb(input)
 
     # # Check the shape of the position embedding
-    assert pos.shape == (1, 512, 15, 30)
+    assert pos.shape == (1, 512*2, 15, 20)

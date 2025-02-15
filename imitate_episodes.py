@@ -18,6 +18,7 @@ from utils import sample_box_pose, sample_insertion_pose  # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict  # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
+from sim_utils import NumpyRingBuffer # For storing the history
 
 from sim_env import BOX_POSE
 
@@ -92,6 +93,17 @@ def main(args):
                          'camera_names': camera_names, }
     else:
         raise NotImplementedError
+    
+    # Get the qpos_history, action_history, and image_history from the config
+    multi_history = args.get('multi_history', False)
+    if multi_history:
+        qpos_history = args.get('qpos_history', [])
+        action_history = args.get('action_history', [])
+        image_history = args.get('image_history', [])
+    else:
+        qpos_history = []
+        action_history = []
+        image_history = []
 
     config = {
         'num_epochs': num_epochs,
@@ -123,7 +135,7 @@ def main(args):
         exit()
 
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train,
-                                                           batch_size_val)
+                                                           batch_size_val, qpos_history=qpos_history, action_history=action_history, image_history=image_history)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -190,6 +202,36 @@ def eval_bc(config, ckpt_name, save_episode=True):
     camera_names_eval = config['policy_config']['camera_names_eval']
     onscreen_cam = 'angle'
 
+    # Initialize qpos history buffer for inference
+    # Get qpos_history from policy_config - this is a list of history indices like [0, 1, 2]
+    qpos_history_list = policy_config.get('qpos_history', [])
+    qpos_history_buffer = None
+    if len(qpos_history_list) > 0:
+        # Buffer needs to hold at least max(history_indices) + 1 elements
+        buffer_capacity = max(qpos_history_list) + 2  # +2 for safety and current frame
+        qpos_history_buffer = NumpyRingBuffer(buffer_capacity, shape=(state_dim,), dtype=np.float32)
+    
+    # Initialize action history buffer for inference  
+    # Get action_history from policy_config - this is a list of history indices like [3, 10]
+    action_history_list = policy_config.get('action_history', [])
+    action_history_buffer = None
+    if len(action_history_list) > 0:
+        # Buffer needs to hold at least max(history_indices) + 1 elements
+        buffer_capacity = max(action_history_list) + 2  # +2 for safety and current frame
+        action_history_buffer = NumpyRingBuffer(buffer_capacity, shape=(state_dim,), dtype=np.float32)
+
+    # Initialize image history buffer for inference
+    # Get image_history from policy_config - this is a list of history indices like [1, 3]
+    image_history_list = policy_config.get('image_history', [])
+    image_history_buffer = None
+    if len(image_history_list) > 0:
+        # Buffer needs to hold at least max(history_indices) + 1 elements
+        buffer_capacity = max(image_history_list) + 2  # +2 for safety and current frame
+        # Image shape: (num_cameras, H, W, C)
+        num_cameras = len(camera_names)
+        # Note: We'll get the actual image dimensions from the first observation
+        image_history_buffer = None  # Will initialize after first observation
+
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
@@ -203,8 +245,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
     with open(stats_path, 'rb') as f:
         stats = pickle.load(f)
 
-    pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
-    post_process = lambda a: a * stats['action_std'] + stats['action_mean']
+    pre_process_qpos = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
+    pre_process_action = lambda s_action: (s_action - stats['action_mean']) / stats['action_std']
+    post_process_action = lambda a: a * stats['action_std'] + stats['action_mean']
 
     # load environment
     if real_robot:
@@ -247,7 +290,6 @@ def eval_bc(config, ckpt_name, save_episode=True):
         if temporal_agg:
             all_time_actions = torch.zeros([max_timesteps, max_timesteps + num_queries, state_dim]).cuda()
 
-        qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
         image_list = []  # for visualization
         qpos_list = []
         target_qpos_list = []
@@ -266,18 +308,76 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     image_list.append(obs['images'])
                 else:
                     image_list.append({'main': obs['image']})
+                
+                # Get current qpos
                 qpos_numpy = np.array(obs['qpos'])
-                qpos = pre_process(qpos_numpy)
-                qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
-                qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names)
+                
+                # Build qpos with history for model input
+                if qpos_history_buffer is not None:
+                    # Update history buffer with current qpos
+                    qpos_history_buffer.append(qpos_numpy)
+                    
+                    # Get current + history: [0] for current, [1,2,3...] for history (shift indices by 1)
+                    adjusted_indices = [0] + [i + 1 for i in qpos_history_list]
+                    qpos_processed = qpos_history_buffer.get(adjusted_indices)
+                else:
+                    # No history, just use current qpos with dimension for consistency
+                    qpos_processed = qpos_numpy.reshape(1, -1)  # (1, state_dim)
+                
+                # Apply normalization
+                qpos_processed = pre_process_qpos(qpos_processed)
+                qpos_processed = torch.from_numpy(qpos_processed).float().cuda().unsqueeze(0)
+                
+                # Build action history for model input from buffer (following EpisodicDataset logic)
+                action_history_processed = None
+                if action_history_buffer is not None:
+                    if action_history_buffer.size > 0:  # Check if buffer has any data
+                        # Get action history using the actual history indices
+                        action_history_data = action_history_buffer.get(action_history_list)
+                        # Apply action normalization (same as in EpisodicDataset)
+                        action_history_data = pre_process_action(action_history_data)
+                        action_history_processed = torch.from_numpy(action_history_data).float().cuda().unsqueeze(0)
+                    else:
+                        # If buffer is empty, create zeros tensor (same as in EpisodicDataset)
+                        action_history_processed = torch.zeros(1, len(action_history_list), state_dim).float().cuda()
+                
+                curr_image = get_image(ts, camera_names)  # (1, num_cameras, C, H, W)
+
+                # Build image data with history for model input (similar to qpos_history logic)
+                if len(image_history_list) > 0:
+                    # Initialize buffer on first timestep
+                    if image_history_buffer is None and t == 0:
+                        # curr_image shape: (1, num_cameras, C, H, W)
+                        _, num_cameras, C, H, W = curr_image.shape
+                        buffer_capacity = max(image_history_list) + 2
+                        # Store images in (num_cameras, C, H, W) format
+                        image_history_buffer = NumpyRingBuffer(buffer_capacity, shape=(num_cameras, C, H, W), dtype=np.float32)
+                    
+                    if image_history_buffer is not None:
+                        # Update buffer with current image (remove batch dimension)
+                        curr_image_np = curr_image.squeeze(0).cpu().numpy()  # (num_cameras, C, H, W)
+                        image_history_buffer.append(curr_image_np)
+                        
+                        # Get current + history: [0] for current, [1,2,3...] for history (shift indices by 1)
+                        adjusted_indices = [0] + [i + 1 for i in image_history_list]
+                        image_data = image_history_buffer.get(adjusted_indices)  # (num_frames, num_cameras, C, H, W)
+                        
+                        # Convert to tensor and add batch dimension: (1, num_frames, num_cameras, C, H, W)
+                        curr_image = torch.from_numpy(image_data).float().cuda().unsqueeze(0)
+                    else:
+                        # Fallback: just add history dimension
+                        curr_image = curr_image.unsqueeze(1)
+                else:
+                    # No image history, just add dimension for consistency
+                    curr_image = curr_image.unsqueeze(1)
+
                 task_embeddings = clip.get_text_feature(eval_task).unsqueeze(dim=0).cuda()
 
-                ### query policy
+                ### query policy - use processed qpos and action history
                 if config['policy_class'] == "ACT":
                     if t % query_frequency == 0:
                         camera_indices = [camera_names.index(cam_name) for cam_name in camera_names_eval]
-                        all_actions = policy(qpos, curr_image, task_embeddings=task_embeddings,
+                        all_actions = policy(qpos_processed, curr_image, action_history_data=action_history_processed, task_embeddings=task_embeddings,
                                              camera_indices=camera_indices)
                     if temporal_agg:
                         all_time_actions[[t], t:t + num_queries] = all_actions
@@ -292,14 +392,18 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     else:
                         raw_action = all_actions[:, t % query_frequency]
                 elif config['policy_class'] == "CNNMLP":
-                    raw_action = policy(qpos, curr_image)
+                    raw_action = policy(qpos_processed, curr_image)
                 else:
                     raise NotImplementedError
 
                 ### post-process actions
                 raw_action = raw_action.squeeze(0).cpu().numpy()
-                action = post_process(raw_action)
+                action = post_process_action(raw_action)
                 target_qpos = action
+                
+                # Update action history buffer with the computed action
+                if action_history_buffer is not None:
+                    action_history_buffer.append(action)
 
                 ### step the environment
                 ts = env.step(target_qpos)
@@ -348,8 +452,17 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 
 def forward_pass(data, policy, clip, camera_names, multi_options={}):
-    image_data, qpos_data, action_data, task_names, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    image_data, qpos_data, action_data, task_names, is_pad, action_history_data = data
+
+    image_data = data['image_data'].cuda()
+    qpos_data = data['qpos_data'].cuda()
+    action_data = data['action_data'].cuda()
+    is_pad = data['is_pad'].cuda()
+    action_history_data = data['action_history_data'].cuda()
+
+    # Convert task_name_tensors back to strings
+    task_name_tensors = data['task_name_tensor'] 
+    task_names = [''.join([chr(c.item()) for c in task_tensor]) for task_tensor in task_name_tensors]
 
     # Make the task embeddings
     task_embeddings = [clip.get_text_feature(task_name) for task_name in task_names]
@@ -374,9 +487,14 @@ def forward_pass(data, policy, clip, camera_names, multi_options={}):
     # --- Multi horizon ---
     # Get the multi horizon option
     multi_horizon = multi_options.get('multi_horizon', False)
+    multi_horizon_ratio = multi_options.get('multi_horizon_ratio', 1.0)
 
     num_queries = policy.model.num_queries    
-    if multi_horizon:
+    
+    # Randomly choose whether to apply multi_horizon based on multi_horizon_ratio
+    apply_multi_horizon = np.random.uniform() < multi_horizon_ratio
+
+    if multi_horizon and apply_multi_horizon:
         # Choose a random value between 1 and self.model.num_queries
         rand_num_queries = torch.randint(1, num_queries, (1,))
 
@@ -388,7 +506,7 @@ def forward_pass(data, policy, clip, camera_names, multi_options={}):
         is_pad = is_pad[:, :num_queries]
 
     # Get the policy output
-    return policy(qpos_data, image_data, action_data, task_embeddings, camera_indices, is_pad)
+    return policy(qpos_data, image_data, action_data, action_history_data, task_embeddings, camera_indices, is_pad)
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -401,8 +519,11 @@ def train_bc(train_dataloader, val_dataloader, config):
     resume = config['resume']
 
     multi_options = {
-        'multi_camera': config.get('multi_camera', True),
-        'multi_horizon': config.get('multi_horizon', True),
+        'multi_camera': policy_config.get('multi_camera', True),
+        'multi_horizon': policy_config.get('multi_horizon', True),
+        'multi_horizon_ratio': policy_config.get('multi_horizon_ratio', 1.0),
+        'multi_history': policy_config.get('multi_history', True),
+        'qpos_history': policy_config.get('qpos_history', {}), # array of which qpos history to select
     }
 
     set_seed(seed)

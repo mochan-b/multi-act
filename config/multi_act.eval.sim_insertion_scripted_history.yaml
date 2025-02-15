@@ -11,11 +11,10 @@ task_config_dir: config
 task_name:
   - sim_insertion_scripted
   - sim_transfer_cube_scripted
-ckpt_dir: ckpt/mh7
+ckpt_dir: ckpt/mhist1
 policy_class: ACT
 kl_weight: 10
-chunk_size: 100
-eval_chunk_size: 100
+chunk_size: 80
 hidden_dim: 512
 batch_size: 8
 dim_feedforward: 3200
@@ -23,21 +22,13 @@ num_epochs: 10000
 lr: 1.e-5
 seed: 0
 
-# Options for different types of multi
-multi_camera: True
-multi_horizon: True
-multi_horizon_ratio: 0.5 # What percentage will be use a randomized horizon
-
 # History options
-multi_history: True
-qpos_history: [0, 1, 3, 7]
-action_history: [3, 10]
-image_history: [1, 3]
-history_backbone: mobilenet_v3_small  # Backbone for image history (lighter than main backbone)
+qpos_history: [2, 5]
 
 # Additional arguments that are needed
 eval: True
-onscreen_render: True
+onscreen_render: False
 temporal_agg: False
-eval_task: sim_transfer_cube_scripted
-camera_names_eval: ['top', 'angle']
+eval_task: sim_insertion_scripted
+camera_names_eval: ['top', 'angle', 'vis']
+eval_num_queries: 80
