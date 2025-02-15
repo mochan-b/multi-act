@@ -80,7 +80,7 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)  # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(3, hidden_dim)  # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, task_embeddings=None, camera_indices=None, is_pad=None):
+    def forward(self, qpos_data, image, env_state, actions=None, task_embeddings=None, camera_indices=None, is_pad=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -88,6 +88,10 @@ class DETRVAE(nn.Module):
         actions: batch, seq, action_dim
         """
         is_training = actions is not None  # train or val
+        
+        # Take qpos as the last element but keep the batches the same
+        qpos = qpos_data[:, -1]
+
         bs, _ = qpos.shape
         ### Obtain latent z from action sequence
         if is_training:

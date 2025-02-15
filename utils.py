@@ -6,13 +6,17 @@ from torch.utils.data import TensorDataset, DataLoader
 
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dirs, camera_names, norm_stats):
+    def __init__(self, episode_ids, dataset_dirs, camera_names, norm_stats,
+                 fix_start_ts=None, query_history=0, action_history=0):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dirs = dataset_dirs
         self.camera_names = camera_names
         self.n_cameras = len(camera_names)
         self.norm_stats = norm_stats
+        self.fix_start_ts = fix_start_ts
+        self.query_history = query_history
+        self.action_history = action_history
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
 
@@ -35,10 +39,30 @@ class EpisodicDataset(torch.utils.data.Dataset):
             if sample_full_episode:
                 start_ts = 0
             else:
-                start_ts = np.random.choice(episode_len)
+                if self.fix_start_ts is not None:
+                    start_ts = self.fix_start_ts
+                else:
+                    start_ts = np.random.choice(episode_len)
 
-            # get observation at start_ts only
-            qpos = root['/observations/qpos'][start_ts]
+            # ------------------------------------------------------------------
+            # 1. Load qpos with history
+            #    We'll gather `query_history + 1` frames: the current frame at 
+            #    `start_ts` plus `query_history` preceding frames (if available).
+            # ------------------------------------------------------------------
+            start_index = start_ts - self.query_history
+            if start_index < 0:
+                # We don't have enough past frames, so replicate the earliest 
+                # qpos if the requested history extends before index 0
+                needed_frames = -start_index  # how many frames we are missing
+                # slice_data is from time 0 up to and including start_ts
+                slice_data = root['/observations/qpos'][0 : start_ts + 1]
+                # replicate the first row `needed_frames` times
+                pad = np.repeat(slice_data[0:1], needed_frames, axis=0)
+                qpos = np.concatenate([pad, slice_data], axis=0)
+            else:
+                # We can directly slice from start_index to start_ts (inclusive)
+                qpos = root['/observations/qpos'][start_index : (start_ts + 1)]
+
             qvel = root['/observations/qvel'][start_ts]
             image_dict = dict()
             for cam_name in self.camera_names:
