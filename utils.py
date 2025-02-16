@@ -7,7 +7,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(self, episode_ids, dataset_dirs, camera_names, norm_stats,
-                 fix_start_ts=None, query_history=0, action_history=0):
+                fix_start_ts=None, query_history=0, action_history=0, image_history=0):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dirs = dataset_dirs
@@ -17,6 +17,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.fix_start_ts = fix_start_ts
         self.query_history = query_history
         self.action_history = action_history
+        self.image_history = image_history
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
 
@@ -77,18 +78,27 @@ class EpisodicDataset(torch.utils.data.Dataset):
                     # action if the requested history extends before index 0
                     needed_frames = -start_index_action  # how many frames we are missing
                     # slice_data is from time 0 up to and including start_ts
-                    slice_data = root['/action'][0: start_ts + 1]
+                    slice_data = root['/action'][0: start_ts]
                     # replicate the first row `needed_frames` times
                     pad = np.repeat(slice_data[0:1], needed_frames, axis=0)
                     action_history_data = np.concatenate([pad, slice_data], axis=0)
                 else:
                     # We can directly slice from start_index to start_ts (inclusive)
-                    action_history_data = root['/action'][start_index_action: (start_ts + 1)]
+                    action_history_data = root['/action'][start_index_action: (start_ts)]
 
-            qvel = root['/observations/qvel'][start_ts]
-            image_dict = dict()
-            for cam_name in self.camera_names:
-                image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+            # ------------------------------------------------------------------
+            # 3. Load image with history
+            # ------------------------------------------------------------------
+            all_cam_images = []
+            for i in range(self.image_history + 1):
+                # Get the timestamp for the image and replicate the first frame if needed
+                ts = max(0, start_ts - i)
+                cam_images = []
+                for cam_name in self.camera_names:
+                    cam_images.append(root[f'/observations/images/{cam_name}'][ts])
+                all_cam_images.append(np.stack(cam_images, axis=0)) # reverse so latest is last
+            # Stack the images and reverse the order so that the latest frame is first
+            all_cam_images = np.stack(all_cam_images[::-1], axis=0)
             
             # get all actions after and including start_ts
             if is_sim:
@@ -97,19 +107,13 @@ class EpisodicDataset(torch.utils.data.Dataset):
             else:
                 action = root['/action'][max(0, start_ts - 1):]  # hack, to make timesteps more aligned
                 action_len = episode_len - max(0, start_ts - 1)  # hack, to make timesteps more aligned
-
+    
         self.is_sim = is_sim
         padded_action = np.zeros(original_action_shape, dtype=np.float32)
         padded_action[:action_len] = action
         is_pad = np.zeros(episode_len)
         is_pad[action_len:] = 1
-
-        # new axis for different cameras
-        all_cam_images = []
-        for cam_name in self.camera_names:
-            all_cam_images.append(image_dict[cam_name])
-        all_cam_images = np.stack(all_cam_images, axis=0)
-
+    
         # construct observations
         image_data = torch.from_numpy(all_cam_images)
         qpos_data = torch.from_numpy(qpos).float()
@@ -118,7 +122,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         action_history_data = torch.from_numpy(action_history_data).float()
 
         # channel last
-        image_data = torch.einsum('k h w c -> k c h w', image_data)
+        image_data = torch.einsum('p k h w c -> p k c h w', image_data)
 
         # normalize image and change dtype to float
         image_data = image_data / 255.0
