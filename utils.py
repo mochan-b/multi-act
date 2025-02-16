@@ -63,10 +63,33 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 # We can directly slice from start_index to start_ts (inclusive)
                 qpos = root['/observations/qpos'][start_index : (start_ts + 1)]
 
+            # ------------------------------------------------------------------
+            # 2. Load action with history
+            #    We'll gather `action_history + 1` frames: the current frame at
+            #    `start_ts` plus `action_history` preceding frames (if available).
+            # ------------------------------------------------------------------
+            if self.action_history == 0:
+                action_history_data = np.array([])
+            else:
+                start_index_action = start_ts - self.action_history
+                if start_index_action < 0:
+                    # We don't have enough past frames, so replicate the earliest
+                    # action if the requested history extends before index 0
+                    needed_frames = -start_index_action  # how many frames we are missing
+                    # slice_data is from time 0 up to and including start_ts
+                    slice_data = root['/action'][0: start_ts + 1]
+                    # replicate the first row `needed_frames` times
+                    pad = np.repeat(slice_data[0:1], needed_frames, axis=0)
+                    action_history_data = np.concatenate([pad, slice_data], axis=0)
+                else:
+                    # We can directly slice from start_index to start_ts (inclusive)
+                    action_history_data = root['/action'][start_index_action: (start_ts + 1)]
+
             qvel = root['/observations/qvel'][start_ts]
             image_dict = dict()
             for cam_name in self.camera_names:
                 image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+            
             # get all actions after and including start_ts
             if is_sim:
                 action = root['/action'][start_ts:]
@@ -92,6 +115,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         qpos_data = torch.from_numpy(qpos).float()
         action_data = torch.from_numpy(padded_action).float()
         is_pad = torch.from_numpy(is_pad).bool()
+        action_history_data = torch.from_numpy(action_history_data).float()
 
         # channel last
         image_data = torch.einsum('k h w c -> k c h w', image_data)
@@ -100,8 +124,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
         image_data = image_data / 255.0
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+        if self.action_history > 0:
+            action_history_data = (action_history_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
 
-        return image_data, qpos_data, action_data, task_name, is_pad
+        return image_data, qpos_data, action_data, task_name, is_pad, action_history_data
 
 
 def get_norm_stats(dataset_dir, num_episodes):

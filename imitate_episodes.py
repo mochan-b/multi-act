@@ -348,7 +348,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 
 def forward_pass(data, policy, clip, camera_names, multi_options={}):
-    image_data, qpos_data, action_data, task_names, is_pad = data
+    image_data, qpos_data, action_data, task_names, is_pad, action_history_data = data
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
 
     # Make the task embeddings
