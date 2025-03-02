@@ -31,7 +31,7 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
 
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, eval_num_queries, camera_names):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, eval_num_queries, camera_names, qpos_history):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -66,21 +66,31 @@ class DETRVAE(nn.Module):
         self.input_task_embeddings = nn.Linear(512, hidden_dim)
         self.camera_embeddings = nn.Embedding(len(camera_names), hidden_dim)
 
+        self.qpos_history = qpos_history
+        self.qpos_history_min = qpos_history[0]
+        self.qpos_history_max = qpos_history[1]
+
         # encoder extra parameters
         self.latent_dim = 32  # final size of latent z # TODO tune
         self.cls_embed = nn.Embedding(1, hidden_dim)  # extra cls token embedding
         self.encoder_action_proj = nn.Linear(14, hidden_dim)  # project action to embedding
         self.encoder_joint_proj = nn.Linear(14, hidden_dim)  # project qpos to embedding
+        
+        # History projections and embeddings
+        if self.qpos_history_min > 0:
+            self.encoder_qpos_history_proj = nn.Linear(14 * self.qpos_history_min, hidden_dim) # project qpos history to embedding
+            self.encoder_qpos_history_embedding = nn.Embedding(self.qpos_history_min, hidden_dim) # learned position embedding for qpos history for the fixed part
+        
         self.encoder_task_proj = nn.Linear(512, hidden_dim)  # project task embedding to embedding
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)  # project hidden state to latent std, var
         self.register_buffer('pos_table',
-                             get_sinusoid_encoding_table(1 + 1 + 1 + num_queries, hidden_dim))  # [CLS], qpos, a_seq
+                             get_sinusoid_encoding_table(1 + 1 + 1 + num_queries + self.qpos_history_min, hidden_dim))  # [CLS], qpos, a_seq
 
         # decoder extra parameters
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)  # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(3, hidden_dim)  # learned position embedding for proprio and latent
 
-    def forward(self, qpos_data, image, env_state, actions=None, task_embeddings=None, camera_indices=None, is_pad=None):
+    def forward(self, qpos_data, image_data, env_state, actions=None, task_embeddings=None, camera_indices=None, is_pad=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -90,7 +100,12 @@ class DETRVAE(nn.Module):
         is_training = actions is not None  # train or val
         
         # Take qpos as the last element but keep the batches the same
-        qpos = qpos_data[:, -1]
+        # qpos = qpos_data[:, -1]
+        qpos = qpos_data
+        qpos_history_fixed = qpos_data[:, -self.qpos_history_min:]
+        qpos_history_variable = qpos_data[:, -self.qpos_history_max:-self.qpos_history_min]
+        # image = image_data[:, -1]
+        image = image_data
 
         bs, _ = qpos.shape
         ### Obtain latent z from action sequence
@@ -99,20 +114,29 @@ class DETRVAE(nn.Module):
             action_embed = self.encoder_action_proj(actions)  # (bs, seq, hidden_dim)
             qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)
             qpos_embed = torch.unsqueeze(qpos_embed, axis=1)  # (bs, 1, hidden_dim)
+
+            # project qpos history to embedding dim
+            if self.qpos_history_min > 0:
+                qpos_history_fixed = qpos_history_fixed.view(bs, -1)
+                qpos_history_fixed_embed = self.encoder_qpos_history_proj(qpos_history_fixed)
+                qpos_history_fixed_embed = torch.unsqueeze(qpos_history_fixed_embed, axis=1)
+                qpos_history_fixed_embed_addl = self.encoder_qpos_history_embedding(torch.arange(self.qpos_history_min).to(qpos.device))
+                qpos_history_fixed_embed = qpos_history_fixed_embed + qpos_history_fixed_embed_addl
+
             cls_embed = self.cls_embed.weight  # (1, hidden_dim)
             cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1)  # (bs, 1, hidden_dim)
             task_name_embed = self.encoder_task_proj(task_embeddings)  # (bs, hidden_dim)
             task_name_embed = torch.unsqueeze(task_name_embed, axis=1)
-            encoder_input = torch.cat([cls_embed, qpos_embed, action_embed, task_name_embed],
+            encoder_input = torch.cat([cls_embed, qpos_embed, action_embed, task_name_embed, qpos_history_fixed_embed],
                                       axis=1)  # (bs, seq+1, hidden_dim)
             encoder_input = encoder_input.permute(1, 0, 2)  # (seq+1, bs, hidden_dim)
             # do not mask cls token
-            cls_joint_is_pad = torch.full((bs, 3), False).to(qpos.device)  # False: not a padding
+            cls_joint_is_pad = torch.full((bs, 3 + self.qpos_history_min), False).to(qpos.device)  # False: not a padding
             is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  # (bs, seq+1)
             # obtain position embedding
             pos_embed = self.pos_table.clone().detach()
             pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)
-            action_len = actions.shape[1] + 1 + 1 + 1
+            action_len = actions.shape[1] + 1 + 1 + 1 + self.qpos_history_min
             pos_embed = pos_embed[:action_len]
             # query model
             encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
@@ -275,6 +299,7 @@ def build(args):
         num_queries=args.num_queries,
         eval_num_queries=args.eval_num_queries,
         camera_names=args.camera_names,
+        qpos_history=args.qpos_history,
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

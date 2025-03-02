@@ -28,7 +28,7 @@ def get_dataset_data(fix_start_ts=None, query_history=0, action_history=0, image
     norm_stats = get_norm_stats([dataset_dirs], [num_episodes])
 
     dataset = EpisodicDataset(episode_ids, [dataset_dirs], camera_names, norm_stats, fix_start_ts=fix_start_ts,
-                               query_history=query_history, action_history=action_history, image_history=image_history)
+                               qpos_history=query_history, action_history=action_history, image_history=image_history)
     data = dataset[0]
 
     image_data, qpos_data, action_data, task_name, is_pad, action_history_data = data

@@ -7,7 +7,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(self, episode_ids, dataset_dirs, camera_names, norm_stats,
-                fix_start_ts=None, query_history=0, action_history=0, image_history=0):
+                fix_start_ts=None, qpos_history=0, action_history=0, image_history=0):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dirs = dataset_dirs
@@ -15,7 +15,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.n_cameras = len(camera_names)
         self.norm_stats = norm_stats
         self.fix_start_ts = fix_start_ts
-        self.query_history = query_history
+        self.qpos_history = qpos_history
         self.action_history = action_history
         self.image_history = image_history
         self.is_sim = None
@@ -50,7 +50,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
             #    We'll gather `query_history + 1` frames: the current frame at 
             #    `start_ts` plus `query_history` preceding frames (if available).
             # ------------------------------------------------------------------
-            start_index = start_ts - self.query_history
+            start_index = start_ts - self.qpos_history
             if start_index < 0:
                 # We don't have enough past frames, so replicate the earliest 
                 # qpos if the requested history extends before index 0
@@ -77,11 +77,16 @@ class EpisodicDataset(torch.utils.data.Dataset):
                     # We don't have enough past frames, so replicate the earliest
                     # action if the requested history extends before index 0
                     needed_frames = -start_index_action  # how many frames we are missing
-                    # slice_data is from time 0 up to and including start_ts
-                    slice_data = root['/action'][0: start_ts]
-                    # replicate the first row `needed_frames` times
-                    pad = np.repeat(slice_data[0:1], needed_frames, axis=0)
-                    action_history_data = np.concatenate([pad, slice_data], axis=0)
+
+                    if start_ts == 0:
+                        # If start_ts is 0, we don't have any history, so we pad with first qpos
+                        action_history_data = np.repeat(root['/observations/qpos'][0:1], self.action_history, axis=0)
+                    else:
+                        # slice_data is from time 0 up to and including start_ts
+                        slice_data = root['/action'][0: start_ts]
+                        # replicate the first row `needed_frames` times
+                        pad = np.repeat(slice_data[0:1], needed_frames, axis=0)
+                        action_history_data = np.concatenate([pad, slice_data], axis=0)
                 else:
                     # We can directly slice from start_index to start_ts (inclusive)
                     action_history_data = root['/action'][start_index_action: (start_ts)]
@@ -131,6 +136,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
         if self.action_history > 0:
             action_history_data = (action_history_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
 
+        if action_history_data.shape[0] == 0:
+            action_history_data = torch.zeros(self.action_history, 14)
+
         return image_data, qpos_data, action_data, task_name, is_pad, action_history_data
 
 
@@ -167,7 +175,7 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, qpos_history, action_history, image_history):
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
     train_ratio = 0.8
@@ -186,10 +194,10 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     norm_stats = get_norm_stats(dataset_dir, num_episodes)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_episodes, dataset_dir, camera_names, norm_stats)
-    val_dataset = EpisodicDataset(val_episodes, dataset_dir, camera_names, norm_stats)
+    train_dataset = EpisodicDataset(train_episodes, dataset_dir, camera_names, norm_stats, qpos_history=qpos_history, action_history=action_history, image_history=image_history)
+    val_dataset = EpisodicDataset(val_episodes, dataset_dir, camera_names, norm_stats, qpos_history=qpos_history, action_history=action_history, image_history=image_history)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True,
-                                  num_workers=0)
+                                  num_workers=0, drop_last=True)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=0)
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim

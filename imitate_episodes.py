@@ -18,6 +18,7 @@ from utils import sample_box_pose, sample_insertion_pose  # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict  # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
+from sim_utils import QposHistoryManager  # Import QposHistoryManager
 
 from sim_env import BOX_POSE
 
@@ -92,6 +93,12 @@ def main(args):
                          'camera_names': camera_names, }
     else:
         raise NotImplementedError
+    
+    # Get the qpos_history, action_history, and image_history from the config
+    multi_history = args.get('multi_history', False)
+    qpos_history_minmax = args.get('qpos_history', [0, 0])
+    action_history_minmax = args.get('action_history', [0, 0])
+    image_history_minmax = args.get('image_history', [0, 0])
 
     config = {
         'num_epochs': num_epochs,
@@ -122,8 +129,20 @@ def main(args):
         print()
         exit()
 
+    # Set the data loaders to use the min or max values for the qpos, action, and image history
+    if not multi_history:
+        # Use the min values
+        qpos_history = qpos_history_minmax[0]
+        action_history = action_history_minmax[0]
+        image_history = image_history_minmax[0]
+    else:
+        # Use the max values
+        qpos_history = qpos_history_minmax[1]
+        action_history = action_history_minmax[1]
+        image_history = image_history_minmax[1]
+
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train,
-                                                           batch_size_val)
+                                                           batch_size_val, qpos_history=qpos_history, action_history=action_history, image_history=image_history)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -190,6 +209,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
     camera_names_eval = config['policy_config']['camera_names_eval']
     onscreen_cam = 'angle'
 
+    # Initialize QposHistoryManager to maintain qpos history
+    qpos_history_config = {'qpos_history_min': 0}  # Current + 2 historical values
+    qpos_manager = QposHistoryManager(qpos_history_config)
+
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
@@ -236,6 +259,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
             BOX_POSE[0] = np.concatenate(sample_insertion_pose())  # used in sim reset
 
         ts = env.reset()
+        
+        # Reset qpos manager for each new rollout
+        qpos_manager = QposHistoryManager(qpos_history_config)
 
         ### onscreen render
         if onscreen_render:
@@ -266,17 +292,41 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     image_list.append(obs['images'])
                 else:
                     image_list.append({'main': obs['image']})
+                
+                # Get current qpos
                 qpos_numpy = np.array(obs['qpos'])
+                
+                # Update the qpos history manager with current qpos
+                qpos_manager.update(qpos_numpy)
+                
+                # Get padded history (current + historical values)
+                qpos_history_padded = qpos_manager.get_padded_history()
+                
+                # Process current and historical qpos
+                qpos_processed = np.stack(qpos_history_padded, axis=0)
+                qpos_processed = pre_process(qpos_processed)
+                qpos_processed = torch.from_numpy(qpos_processed).float().cuda().unsqueeze(0)
+                
+                # Store only the current qpos in qpos_history for visualization
                 qpos = pre_process(qpos_numpy)
                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                 qpos_history[:, t] = qpos
+
+                # Add an extra dimension after the batch dimension for the qpos
+                # qpos = qpos.unsqueeze(1)
+                
                 curr_image = get_image(ts, camera_names)
+
+                # Add a dimension for curr_image after the batch dimension for the image_history
+                # curr_image = curr_image.unsqueeze(1)
+
                 task_embeddings = clip.get_text_feature(eval_task).unsqueeze(dim=0).cuda()
 
-                ### query policy
+                ### query policy - use processed qpos history instead of just current qpos
                 if config['policy_class'] == "ACT":
                     if t % query_frequency == 0:
                         camera_indices = [camera_names.index(cam_name) for cam_name in camera_names_eval]
+                        print(qpos)
                         all_actions = policy(qpos, curr_image, task_embeddings=task_embeddings,
                                              camera_indices=camera_indices)
                     if temporal_agg:
@@ -292,7 +342,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     else:
                         raw_action = all_actions[:, t % query_frequency]
                 elif config['policy_class'] == "CNNMLP":
-                    raw_action = policy(qpos, curr_image)
+                    raw_action = policy(qpos_processed, curr_image)
                 else:
                     raise NotImplementedError
 
@@ -349,7 +399,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 def forward_pass(data, policy, clip, camera_names, multi_options={}):
     image_data, qpos_data, action_data, task_names, is_pad, action_history_data = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    image_data, qpos_data, action_data, is_pad, action_history_data = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda(), action_history_data.cuda()
 
     # Make the task embeddings
     task_embeddings = [clip.get_text_feature(task_name) for task_name in task_names]
@@ -401,8 +451,9 @@ def train_bc(train_dataloader, val_dataloader, config):
     resume = config['resume']
 
     multi_options = {
-        'multi_camera': config.get('multi_camera', True),
-        'multi_horizon': config.get('multi_horizon', True),
+        'multi_camera': policy_config.get('multi_camera', True),
+        'multi_horizon': policy_config.get('multi_horizon', True),
+        'multi_history': policy_config.get('multi_history', True),
     }
 
     set_seed(seed)
